@@ -22,6 +22,7 @@ from .impex import (
     import_table,
     import_vcf,
     index_bgen,
+    exclude_samples,
     read_matrix_table,
     read_table,
 )
@@ -130,6 +131,7 @@ __all__ = [
     'pc_relate',
     'pca',
     'poisson_regression_rows',
+    'exclude_samples',
     'read_matrix_table',
     'read_table',
     'realized_relationship_matrix',
