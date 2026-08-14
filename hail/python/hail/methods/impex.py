@@ -2725,6 +2725,7 @@ def read_matrix_table(
     )
     if _n_partitions:
         intervals = mt._calculate_new_partitions(_n_partitions)
+        # The recursive call will apply the blocklist itself.
         return read_matrix_table(
             path,
             _drop_rows=_drop_rows,
@@ -2733,7 +2734,85 @@ def read_matrix_table(
             _assert_type=mt._type,
             _load_refs=_load_refs,
         )
+
+    # Auto-discover and apply an excluded-samples blocklist stored inside the
+    # .mt directory.  The blocklist is a Hail Table at
+    # ``<path>/excluded_samples.ht`` whose key matches the MatrixTable col key.
+    # Use :func:`.exclude_samples` to add samples to the list.
+    if not _drop_cols:
+        blocklist_path = path.rstrip('/') + '/excluded_samples.ht'
+        if Env.fs().exists(blocklist_path):
+            excluded_ht = read_table(blocklist_path, _load_refs=False)
+            mt = mt.anti_join_cols(excluded_ht)
+
     return mt
+
+
+@typecheck(path=str, sample_ids=sequenceof(str))
+def exclude_samples(path, sample_ids):
+    """Add sample IDs to the excluded-samples blocklist for a :class:`.MatrixTable`.
+
+    Samples in the blocklist are automatically filtered out whenever the
+    MatrixTable is loaded with :func:`.read_matrix_table` -- the caller
+    needs no knowledge of the blocklist.
+
+    The blocklist is stored as a Hail Table at
+    ``<path>/excluded_samples.ht`` inside the MatrixTable directory, so it
+    travels with the dataset if the directory is moved.
+
+    The MatrixTable must have a single :class:`.tstr` column-key field (the
+    common ``s`` field used by import VCF / BGEN / PLINK).
+
+    Parameters
+    ----------
+    path : :class:`str`
+        Path to the MatrixTable (``.mt``) directory.
+    sample_ids : list of :class:`str`
+        Sample IDs to add to the exclusion list.  Duplicate and
+        already-excluded IDs are ignored.
+
+    See Also
+    --------
+    :func:`.read_matrix_table`
+    """
+    # Peek at col key schema cheaply (skip rows/entries).
+    mt_peek = MatrixTable(
+        ir.MatrixRead(
+            ir.MatrixNativeReader(path, None, False),
+            drop_cols=False,
+            drop_rows=True,
+            drop_row_uids=True,
+            drop_col_uids=True,
+        )
+    )
+    col_key_fields = list(mt_peek.col_key)
+    if len(col_key_fields) != 1:
+        raise ValueError(
+            f"'exclude_samples' requires a single-field column key, but "
+            f"the MatrixTable at '{path}' has col key fields: {col_key_fields}"
+        )
+    key_field = col_key_fields[0]
+    key_dtype = mt_peek[key_field].dtype
+    if key_dtype != tstr:
+        raise ValueError(
+            f"'exclude_samples' requires a string column key, but "
+            f"col key field '{key_field}' has type '{key_dtype}'"
+        )
+
+    blocklist_path = path.rstrip('/') + '/excluded_samples.ht'
+    new_ht = hl.Table.parallelize(
+        [{key_field: s} for s in sample_ids],
+        schema=hl.tstruct(**{key_field: hl.tstr}),
+    ).key_by(key_field)
+
+    if Env.fs().exists(blocklist_path):
+        existing_ht = read_table(blocklist_path)
+        combined = existing_ht.union(new_ht).distinct()
+    else:
+        combined = new_ht.distinct()
+
+    combined.write(blocklist_path, overwrite=True)
+    info(f"Blocklist updated at '{blocklist_path}'.")
 
 
 @typecheck(path=str)
