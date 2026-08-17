@@ -2800,16 +2800,21 @@ def exclude_samples(path, sample_ids):
         )
 
     blocklist_path = path.rstrip('/') + '/excluded_samples.ht'
-    new_ht = hl.Table.parallelize(
-        [{key_field: s} for s in sample_ids],
-        schema=hl.tstruct(**{key_field: hl.tstr}),
-    ).key_by(key_field)
 
+    # Collect any existing blocked IDs into Python memory (blocklists are small),
+    # then merge with the new IDs.  This avoids Hail's restriction on reading and
+    # writing the same path in a single query.
     if Env.fs().exists(blocklist_path):
         existing_ht = read_table(blocklist_path)
-        combined = existing_ht.union(new_ht).distinct()
+        existing_ids = {row[key_field] for row in existing_ht.collect()}
     else:
-        combined = new_ht.distinct()
+        existing_ids = set()
+
+    all_ids = existing_ids | set(sample_ids)
+    combined = hl.Table.parallelize(
+        [{key_field: s} for s in sorted(all_ids)],
+        schema=hl.tstruct(**{key_field: hl.tstr}),
+    ).key_by(key_field)
 
     combined.write(blocklist_path, overwrite=True)
     info(f"Blocklist updated at '{blocklist_path}'.")
