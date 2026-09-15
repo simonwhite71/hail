@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from collections import defaultdict
@@ -2670,6 +2671,80 @@ def import_plink(
     return MatrixTable(ir.MatrixRead(reader, drop_cols=False, drop_rows=False))
 
 
+_COLS_POINTER_FILE = 'cols_ptr.txt'
+
+_workspace_override = None
+
+
+def set_workspace(name):
+    """Set the workspace name used to resolve ``<workspace>`` in cols-pointer templates.
+
+    A redirected :class:`.MatrixTable` (see :func:`.set_cols_pointer`) may store a pointer whose
+    path contains a literal ``<workspace>`` token. On :func:`.read_matrix_table` that token is
+    replaced with the current workspace, resolved in this order:
+
+    1. the value most recently passed to :func:`.set_workspace`;
+    2. the ``HAIL_WORKSPACE`` environment variable;
+    3. the ``<workspace>`` segment of a Lake Formation ``.../objects/<workspace>/...`` URL found in
+       the ``HAIL_COLS_WORKSPACE_URL`` or ``s3_url`` environment variables.
+
+    Parameters
+    ----------
+    name : :class:`str` or ``None``
+        Workspace name, or ``None`` to clear the override.
+    """
+    global _workspace_override
+    _workspace_override = name
+
+
+def _resolve_workspace():
+    if _workspace_override is not None:
+        return _workspace_override
+    ws = os.environ.get('HAIL_WORKSPACE')
+    if ws:
+        return ws
+    url = os.environ.get('HAIL_COLS_WORKSPACE_URL') or os.environ.get('s3_url', '')
+    match = re.search(r'/objects/([^/]+)', url)
+    return match.group(1) if match else None
+
+
+def _read_cols_pointer(cols_ptr_path):
+    with Env.fs().open(cols_ptr_path) as f:
+        contents = f.read().strip()
+    try:
+        pointer = json.loads(contents)
+    except json.JSONDecodeError:
+        # Back-compat: a bare path string, optionally with a ``<workspace>`` token.
+        pointer = {'cols_uri': contents}
+    cols_uri = pointer['cols_uri']
+    if '<workspace>' in cols_uri:
+        ws = _resolve_workspace()
+        if ws is None:
+            raise FatalError(
+                "MatrixTable columns are redirected to a per-workspace location, but the current "
+                "workspace could not be resolved. Set it with 'hl.set_workspace(<name>)' or the "
+                f"'HAIL_WORKSPACE' environment variable. Pointer template: {cols_uri!r}"
+            )
+        cols_uri = cols_uri.replace('<workspace>', ws)
+    return cols_uri, pointer.get('index_field', 'col_idx'), pointer.get('col_key')
+
+
+def _apply_cols_redirect(mt, cols_ptr_path):
+    cols_uri, index_field, col_key = _read_cols_pointer(cols_ptr_path)
+    if index_field not in mt.col:
+        raise FatalError(
+            f"cols redirect requires the index field {index_field!r} in the MatrixTable columns, "
+            f"but found: {list(mt.col)}"
+        )
+    cols_ht = read_table(cols_uri, _load_refs=False)
+    mt = mt.annotate_cols(**cols_ht[mt[index_field]])
+    if col_key:
+        mt = mt.key_cols_by(*wrap_to_list(col_key))
+    if index_field not in mt.col_key:
+        mt = mt.drop(index_field)
+    return mt, cols_uri
+
+
 @typecheck(
     path=str,
     _intervals=nullable(sequenceof(anytype)),
@@ -2735,15 +2810,28 @@ def read_matrix_table(
             _load_refs=_load_refs,
         )
 
-    # Auto-discover and apply an excluded-samples blocklist stored inside the
-    # .mt directory.  The blocklist is a Hail Table at
-    # ``<path>/excluded_samples.ht`` whose key matches the MatrixTable col key.
-    # Use :func:`.exclude_samples` to add samples to the list.
+    # Transparent governance overlays, applied on every load with no change to
+    # calling code:
+    #   1. Cols redirect (Layer 1) -- if a ``<path>/cols_ptr.txt`` pointer exists,
+    #      the real, identifier-bearing cols table is loaded from an external,
+    #      per-workspace location and reattached by an integer index field. The
+    #      pointer may contain a literal ``<workspace>`` token resolved at read
+    #      time. See :func:`.set_cols_pointer`.
+    #   2. Excluded-samples blocklist (Layer 2) -- samples listed in an
+    #      ``excluded_samples.ht`` Table are filtered out. The blocklist is read
+    #      from the redirected cols location (if any) and from inside the .mt
+    #      directory. See :func:`.exclude_samples`.
     if not _drop_cols:
-        blocklist_path = path.rstrip('/') + '/excluded_samples.ht'
-        if Env.fs().exists(blocklist_path):
-            excluded_ht = read_table(blocklist_path, _load_refs=False)
-            mt = mt.anti_join_cols(excluded_ht)
+        path_root = path.rstrip('/')
+        cols_ptr_path = path_root + '/' + _COLS_POINTER_FILE
+        cols_blocklist_path = None
+        if Env.fs().exists(cols_ptr_path):
+            mt, cols_uri = _apply_cols_redirect(mt, cols_ptr_path)
+            cols_blocklist_path = cols_uri.rsplit('/', 1)[0] + '/excluded_samples.ht'
+
+        for blocklist_path in (cols_blocklist_path, path_root + '/excluded_samples.ht'):
+            if blocklist_path and Env.fs().exists(blocklist_path):
+                mt = mt.anti_join_cols(read_table(blocklist_path, _load_refs=False))
 
     return mt
 
@@ -2775,31 +2863,45 @@ def exclude_samples(path, sample_ids):
     --------
     :func:`.read_matrix_table`
     """
-    # Peek at col key schema cheaply (skip rows/entries).
-    mt_peek = MatrixTable(
-        ir.MatrixRead(
-            ir.MatrixNativeReader(path, None, False),
-            drop_cols=False,
-            drop_rows=True,
-            drop_row_uids=True,
-            drop_col_uids=True,
+    cols_ptr_path = path.rstrip('/') + '/' + _COLS_POINTER_FILE
+    if Env.fs().exists(cols_ptr_path):
+        # Columns are redirected to a per-workspace location; the blocklist lives
+        # alongside that workspace's cols table so identity-specific exclusions
+        # never touch the shared, identifier-free MatrixTable.
+        cols_uri, _index_field, col_key = _read_cols_pointer(cols_ptr_path)
+        if not col_key:
+            raise ValueError(
+                f"the cols pointer at '{cols_ptr_path}' does not record a column key, so "
+                f"'exclude_samples' cannot determine the blocklist key. Recreate it with "
+                f"set_cols_pointer(..., col_key=...)."
+            )
+        key_field = wrap_to_list(col_key)[0]
+        blocklist_path = cols_uri.rsplit('/', 1)[0] + '/excluded_samples.ht'
+    else:
+        # Peek at col key schema cheaply (skip rows/entries).
+        mt_peek = MatrixTable(
+            ir.MatrixRead(
+                ir.MatrixNativeReader(path, None, False),
+                drop_cols=False,
+                drop_rows=True,
+                drop_row_uids=True,
+                drop_col_uids=True,
+            )
         )
-    )
-    col_key_fields = list(mt_peek.col_key)
-    if len(col_key_fields) != 1:
-        raise ValueError(
-            f"'exclude_samples' requires a single-field column key, but "
-            f"the MatrixTable at '{path}' has col key fields: {col_key_fields}"
-        )
-    key_field = col_key_fields[0]
-    key_dtype = mt_peek[key_field].dtype
-    if key_dtype != tstr:
-        raise ValueError(
-            f"'exclude_samples' requires a string column key, but "
-            f"col key field '{key_field}' has type '{key_dtype}'"
-        )
-
-    blocklist_path = path.rstrip('/') + '/excluded_samples.ht'
+        col_key_fields = list(mt_peek.col_key)
+        if len(col_key_fields) != 1:
+            raise ValueError(
+                f"'exclude_samples' requires a single-field column key, but "
+                f"the MatrixTable at '{path}' has col key fields: {col_key_fields}"
+            )
+        key_field = col_key_fields[0]
+        key_dtype = mt_peek[key_field].dtype
+        if key_dtype != tstr:
+            raise ValueError(
+                f"'exclude_samples' requires a string column key, but "
+                f"col key field '{key_field}' has type '{key_dtype}'"
+            )
+        blocklist_path = path.rstrip('/') + '/excluded_samples.ht'
 
     # Collect any existing blocked IDs into Python memory (blocklists are small),
     # then merge with the new IDs.  This avoids Hail's restriction on reading and
@@ -2818,6 +2920,51 @@ def exclude_samples(path, sample_ids):
 
     combined.write(blocklist_path, overwrite=True)
     info(f"Blocklist updated at '{blocklist_path}'.")
+
+
+@typecheck(path=str, cols_uri=str, index_field=str, col_key=nullable(oneof(str, sequenceof(str))))
+def set_cols_pointer(path, cols_uri, *, index_field='col_idx', col_key=None):
+    """Redirect a :class:`.MatrixTable`'s columns to an external, access-controlled location.
+
+    This implements the "cols redirect" governance layer: the shared ``.mt`` holds only the bulk
+    genotype data plus an anonymous integer index field (no identifiers), while the real,
+    identifier-bearing cols table lives in a separate, per-workspace location. A small pointer file
+    ``<path>/cols_ptr.txt`` records where to find it. On every :func:`.read_matrix_table`, the cols
+    table is loaded and reattached transparently -- calling code needs no knowledge of the redirect.
+
+    ``cols_uri`` may contain a literal ``<workspace>`` token, which is resolved at read time (see
+    :func:`.set_workspace`). This lets a single shared MatrixTable present each workspace with its
+    own cols table, e.g.
+    ``s3://<acct>-hrn-inf-lakeformation/objects/<workspace>/cohort-cols.ht``.
+
+    The external cols table must be a :class:`.Table` keyed by ``index_field`` (an integer column
+    index matching the shared MatrixTable's ``index_field`` column). Its remaining fields are
+    annotated onto the columns; when ``col_key`` is given the columns are re-keyed by those fields
+    and the index field is dropped.
+
+    Parameters
+    ----------
+    path : :class:`str`
+        Path to the shared MatrixTable (``.mt``) directory.
+    cols_uri : :class:`str`
+        Path to the external cols :class:`.Table`, optionally containing a ``<workspace>`` token.
+    index_field : :class:`str`
+        Name of the integer index field shared by the MatrixTable columns and the cols table.
+        Defaults to ``'col_idx'``.
+    col_key : :class:`str` or list of :class:`str`, optional
+        Column-key field(s) to set after the cols table is reattached (e.g. ``'s'``).
+
+    See Also
+    --------
+    :func:`.read_matrix_table`, :func:`.set_workspace`, :func:`.exclude_samples`
+    """
+    pointer = {'cols_uri': cols_uri, 'index_field': index_field}
+    if col_key is not None:
+        pointer['col_key'] = wrap_to_list(col_key)
+    cols_ptr_path = path.rstrip('/') + '/' + _COLS_POINTER_FILE
+    with Env.fs().open(cols_ptr_path, 'w') as f:
+        f.write(json.dumps(pointer))
+    info(f"Cols pointer written to '{cols_ptr_path}'.")
 
 
 @typecheck(path=str)

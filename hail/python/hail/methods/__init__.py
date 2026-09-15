@@ -25,6 +25,8 @@ from .impex import (
     exclude_samples,
     read_matrix_table,
     read_table,
+    set_cols_pointer,
+    set_workspace,
 )
 from .misc import filter_intervals, maximal_independent_set, rename_duplicates, segment_intervals
 from .qc import (
@@ -134,6 +136,8 @@ __all__ = [
     'exclude_samples',
     'read_matrix_table',
     'read_table',
+    'set_cols_pointer',
+    'set_workspace',
     'realized_relationship_matrix',
     'rename_duplicates',
     'row_correlation',

@@ -2351,3 +2351,111 @@ def test_import_export_same(i):
 
     assert mt._same(mt2)
     assert mt._same(mt3)
+
+
+class ExcludeSamplesAndColsRedirectTests(unittest.TestCase):
+    @staticmethod
+    def _cohort_mt(n_samples=10, id_prefix='s'):
+        mt = hl.balding_nichols_model(n_populations=2, n_samples=n_samples, n_variants=20)
+        return mt.key_cols_by(s=hl.format(f'{id_prefix}%02d', mt.sample_idx)).select_cols()
+
+    @staticmethod
+    def _shared_mt(path, n_samples=10):
+        """A shared, identifier-free MatrixTable keyed only by an integer col_idx."""
+        mt = hl.balding_nichols_model(n_populations=2, n_samples=n_samples, n_variants=20)
+        mt = mt.key_cols_by(col_idx=mt.sample_idx).select_cols()
+        mt.write(path)
+
+    @staticmethod
+    def _cols_ht(path, n_samples=10, id_prefix='RN-'):
+        ht = hl.utils.range_table(n_samples)
+        ht = ht.annotate(s=hl.format(f'{id_prefix}%02d', ht.idx), cohort='SITE1')
+        ht.rename({'idx': 'col_idx'}).key_by('col_idx').write(path)
+
+    def test_exclude_samples_filters_on_read(self):
+        path = new_temp_file(extension='mt')
+        self._cohort_mt(10).write(path)
+        assert hl.read_matrix_table(path).count_cols() == 10
+
+        hl.exclude_samples(path, ['s00', 's03', 's07'])
+        mt = hl.read_matrix_table(path)
+        assert mt.count_cols() == 7
+        assert set(mt.s.collect()).isdisjoint({'s00', 's03', 's07'})
+
+    def test_exclude_samples_is_idempotent(self):
+        path = new_temp_file(extension='mt')
+        self._cohort_mt(10).write(path)
+        hl.exclude_samples(path, ['s00', 's01'])
+        hl.exclude_samples(path, ['s00', 's01'])  # re-adding already-excluded ids is a no-op
+        assert hl.read_matrix_table(path).count_cols() == 8
+        hl.exclude_samples(path, ['s02'])
+        assert hl.read_matrix_table(path).count_cols() == 7
+
+    def test_cols_redirect_reattaches_external_cols(self):
+        shared = new_temp_file(extension='mt')
+        cols = new_temp_file(extension='ht')
+        self._shared_mt(shared, 10)
+        self._cols_ht(cols, 10, id_prefix='RN-')
+
+        # The shared MT carries no identifiers until the redirect is applied.
+        assert list(hl.read_matrix_table(shared).col_key) == ['col_idx']
+
+        hl.set_cols_pointer(shared, cols, col_key='s')
+        mt = hl.read_matrix_table(shared)
+        assert list(mt.col_key) == ['s']
+        assert 'cohort' in mt.col
+        assert 'col_idx' not in mt.col
+        assert sorted(mt.s.collect())[0] == 'RN-00'
+
+    def test_cols_redirect_resolves_workspace_token(self):
+        shared = new_temp_file(extension='mt')
+        self._shared_mt(shared, 10)
+
+        base = new_temp_file()
+        template = f'{base}/<workspace>/cohort-cols.ht'
+        self._cols_ht(f'{base}/feasibility/cohort-cols.ht', 10, id_prefix='RN-')
+        self._cols_ht(f'{base}/genosphere/cohort-cols.ht', 10, id_prefix='DEID-')
+        hl.set_cols_pointer(shared, template, col_key='s')
+
+        try:
+            hl.set_workspace('feasibility')
+            assert sorted(hl.read_matrix_table(shared).s.collect())[0] == 'RN-00'
+
+            hl.set_workspace('genosphere')
+            assert sorted(hl.read_matrix_table(shared).s.collect())[0] == 'DEID-00'
+        finally:
+            hl.set_workspace(None)
+
+    def test_cols_redirect_unresolved_workspace_errors(self):
+        shared = new_temp_file(extension='mt')
+        self._shared_mt(shared, 10)
+        hl.set_cols_pointer(shared, 'gs://bucket/<workspace>/cols.ht', col_key='s')
+        prev = os.environ.pop('HAIL_WORKSPACE', None)
+        try:
+            hl.set_workspace(None)
+            with pytest.raises(FatalError, match='workspace could not be resolved'):
+                hl.read_matrix_table(shared)
+        finally:
+            if prev is not None:
+                os.environ['HAIL_WORKSPACE'] = prev
+
+    def test_per_workspace_blocklist_is_isolated(self):
+        shared = new_temp_file(extension='mt')
+        self._shared_mt(shared, 10)
+
+        base = new_temp_file()
+        template = f'{base}/<workspace>/cohort-cols.ht'
+        self._cols_ht(f'{base}/feasibility/cohort-cols.ht', 10, id_prefix='RN-')
+        self._cols_ht(f'{base}/genosphere/cohort-cols.ht', 10, id_prefix='DEID-')
+        hl.set_cols_pointer(shared, template, col_key='s')
+
+        try:
+            # Excluding in one workspace must not affect the other.
+            hl.set_workspace('feasibility')
+            hl.exclude_samples(shared, ['RN-00'])
+            assert hl.read_matrix_table(shared).count_cols() == 9
+
+            hl.set_workspace('genosphere')
+            assert hl.read_matrix_table(shared).count_cols() == 10
+        finally:
+            hl.set_workspace(None)
