@@ -2820,7 +2820,10 @@ def read_matrix_table(
     #   2. Excluded-samples blocklist (Layer 2) -- samples listed in an
     #      ``excluded_samples.ht`` Table are filtered out. The blocklist is read
     #      from the redirected cols location (if any) and from inside the .mt
-    #      directory. See :func:`.exclude_samples`.
+    #      directory. See :func:`.exclude_samples`. Sample exclusions are
+    #      withdrawals, so a warning is emitted reporting how many were filtered.
+    #      (A future site/row blocklist -- Layer 3 -- must stay silent, as those
+    #      are governance exclusions rather than consent withdrawals.)
     if not _drop_cols:
         path_root = path.rstrip('/')
         cols_ptr_path = path_root + '/' + _COLS_POINTER_FILE
@@ -2829,9 +2832,14 @@ def read_matrix_table(
             mt, cols_uri = _apply_cols_redirect(mt, cols_ptr_path)
             cols_blocklist_path = cols_uri.rsplit('/', 1)[0] + '/excluded_samples.ht'
 
+        n_excluded = 0
         for blocklist_path in (cols_blocklist_path, path_root + '/excluded_samples.ht'):
             if blocklist_path and Env.fs().exists(blocklist_path):
-                mt = mt.anti_join_cols(read_table(blocklist_path, _load_refs=False))
+                excluded_ht = read_table(blocklist_path, _load_refs=False)
+                n_excluded += excluded_ht.count()
+                mt = mt.anti_join_cols(excluded_ht)
+        if n_excluded > 0:
+            warning(f"read_matrix_table: filtered {n_excluded} withdrawn sample(s) from '{path}'.")
 
     return mt
 
